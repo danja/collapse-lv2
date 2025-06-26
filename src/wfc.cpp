@@ -28,7 +28,11 @@ typedef enum {
     WFC_LEARNING_RATE = 6,
     WFC_RANDOMNESS = 7,
     WFC_BUFFER_SIZE = 8,
-    WFC_MEMORY_LIMIT = 9
+    WFC_MEMORY_LIMIT = 9,
+    WFC_PERIOD_DETECT = 10,
+    WFC_MIN_FREQ = 11,
+    WFC_MAX_FREQ = 12,
+    WFC_PATTERN_REPEATS = 13
 } PortIndex;
 
 // Pattern data structure
@@ -58,6 +62,9 @@ public:
         tempPattern_.reserve(128);
         tempNextPattern_.reserve(128);
         tempString_.reserve(1024);
+        contextPattern_.reserve(128);
+        candidates_.reserve(10000);  // Large enough for typical use
+        patternVec_.reserve(128);
         
         // Initialize performance counters
         totalSamplesProcessed_ = 0;
@@ -152,7 +159,7 @@ public:
     // Quantize sample from [-1, 1] to discrete levels
     int quantize(float sample) {
         sample = std::clamp(sample, -1.0f, 1.0f);
-        return static_cast<int>((sample + 1.0f) * quantLevels_ / 2.0f);
+        return static_cast<int>((sample + 1.0f) * (quantLevels_ - 1) / 2.0f);
     }
     
     // Dequantize level back to [-1, 1]
@@ -190,8 +197,8 @@ public:
             
             patterns_[patternKey].count++;
             
-            // Add next pattern if available
-            if (i + patternSize_ < count) {
+            // Add next pattern if available and within memory limits
+            if (i + patternSize_ < count && patterns_[patternKey].nextPatterns.size() < 100) {
                 // Use pre-allocated buffer for next pattern too
                 tempNextPattern_.clear();
                 
@@ -229,43 +236,51 @@ public:
         }
     }
     
+    // Update context with new input sample using circular buffer
+    void updateContext(float sample) {
+        if (!context_.empty()) {
+            context_[contextIndex_] = sample;
+            contextIndex_ = (contextIndex_ + 1) % context_.size();
+        }
+    }
+    
     // Generate next sample based on current context
     float generateSample() {
-        if (patterns_.empty()) {
-            // No patterns learned yet, return gentle noise
-            std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
-            return dist(rng_);
+        // Don't generate until we have enough patterns
+        if (patterns_.empty() || totalSamplesProcessed_ < 1000) {
+            return 0.0f; // Return silence until we learn patterns
         }
         
-        // Convert current context to quantized pattern
-        std::vector<int> contextPattern;
-        contextPattern.reserve(context_.size());
-        for (float sample : context_) {
-            contextPattern.push_back(quantize(sample));
+        // Convert current context to quantized pattern using pre-allocated buffer
+        contextPattern_.clear();
+        // Read from circular buffer in correct order
+        for (size_t i = 0; i < context_.size(); ++i) {
+            size_t idx = (contextIndex_ + i) % context_.size();
+            contextPattern_.push_back(quantize(context_[idx]));
         }
         
-        std::string contextKey = vectorToString(contextPattern);
+        std::string contextKey = vectorToString(contextPattern_);
         
-        // Find matching patterns
-        std::vector<int> candidates;
+        // Find matching patterns using pre-allocated buffer
+        candidates_.clear();
         int totalWeight = 0;
         
         for (const auto& [pattern, data] : patterns_) {
-            std::vector<int> patternVec = stringToVector(pattern);
+            stringToVector(pattern, patternVec_);  // Use pre-allocated buffer
             
             // Check if pattern starts with our context
             bool matches = true;
-            for (size_t i = 0; i < contextPattern.size() && i < patternVec.size() - 1; ++i) {
-                if (contextPattern[i] != patternVec[i]) {
+            for (size_t i = 0; i < contextPattern_.size() && i < patternVec_.size() - 1; ++i) {
+                if (contextPattern_[i] != patternVec_[i]) {
                     matches = false;
                     break;
                 }
             }
             
-            if (matches && !patternVec.empty()) {
+            if (matches && !patternVec_.empty()) {
                 int weight = data.count;
                 for (int i = 0; i < weight; ++i) {
-                    candidates.push_back(patternVec.back());
+                    candidates_.push_back(patternVec_.back());
                 }
                 totalWeight += weight;
             }
@@ -273,21 +288,20 @@ public:
         
         float nextSample;
         
-        if (candidates.empty() || (randomness_ > 0.0f && 
+        if (candidates_.empty() || (randomness_ > 0.0f && 
             std::uniform_real_distribution<float>(0.0f, 1.0f)(rng_) < randomness_)) {
-            // No candidates or random mode - generate random sample
-            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            // No candidates or random mode - generate quiet random sample
+            std::uniform_real_distribution<float> dist(-0.01f, 0.01f);
             nextSample = dist(rng_);
         } else {
             // Select weighted random candidate
-            std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-            int selectedLevel = candidates[dist(rng_)];
+            std::uniform_int_distribution<size_t> dist(0, candidates_.size() - 1);
+            int selectedLevel = candidates_[dist(rng_)];
             nextSample = dequantize(selectedLevel);
         }
         
-        // Update context
-        context_.erase(context_.begin());
-        context_.push_back(nextSample);
+        // Update context using circular buffer
+        updateContext(nextSample);
         
         return nextSample;
     }
@@ -313,22 +327,26 @@ private:
     mutable std::vector<int> tempPattern_;
     mutable std::vector<int> tempNextPattern_;
     mutable std::string tempString_;
+    mutable std::vector<int> contextPattern_;
+    mutable std::vector<int> candidates_;
+    mutable std::vector<int> patternVec_;
     
     std::vector<float> context_;
+    size_t contextIndex_ = 0;  // For circular context buffer
     std::unordered_map<std::string, PatternData> patterns_;
     std::mt19937 rng_;
     
-    std::string vectorToString(const std::vector<int>& vec) {
-        std::string result;
+    std::string vectorToString(const std::vector<int>& vec) const {
+        tempString_.clear();
         for (size_t i = 0; i < vec.size(); ++i) {
-            if (i > 0) result += ",";
-            result += std::to_string(vec[i]);
+            if (i > 0) tempString_ += ",";
+            tempString_ += std::to_string(vec[i]);
         }
-        return result;
+        return tempString_;
     }
     
-    std::vector<int> stringToVector(const std::string& str) {
-        std::vector<int> result;
+    void stringToVector(const std::string& str, std::vector<int>& result) const {
+        result.clear();
         size_t start = 0;
         size_t end = 0;
         
@@ -337,8 +355,6 @@ private:
             start = end + 1;
         }
         result.push_back(std::stoi(str.substr(start)));
-        
-        return result;
     }
     
     // Remove patterns with low frequency
@@ -386,6 +402,10 @@ typedef struct {
     const float* randomness;
     const float* bufferSize;
     const float* memoryLimit;
+    const float* periodDetectEnable;
+    const float* minFreq;
+    const float* maxFreq;
+    const float* patternRepeats;
     
     // Internal state
     WaveformWFC* wfc;
@@ -400,7 +420,131 @@ typedef struct {
     // Performance monitoring
     size_t totalSamplesProcessed;
     size_t lastMemoryUsage;
+    
+    // Period detection state
+    std::vector<float> correlationBuffer;
+    size_t correlationPos;
+    size_t detectedPeriod;
+    float correlationThreshold;
+    
+    // Pattern alternation state
+    std::vector<float> currentPattern;  // Current predicted pattern
+    std::vector<float> nextPattern;     // Next predicted pattern (background)
+    size_t patternPlaybackPos;          // Position in current pattern
+    size_t currentRepeatCount;          // How many times current pattern has played
+    bool backgroundPredictionReady;     // Is next pattern ready?
 } WfcPlugin;
+
+// Period detection using autocorrelation
+static size_t detectPeriod(WfcPlugin* plugin, float minFreq, float maxFreq) {
+    // Safety checks
+    if (plugin->correlationBuffer.empty() || plugin->correlationPos < 1000) {
+        return 0; // Need at least 1000 samples for reliable detection
+    }
+    
+    size_t minPeriod = static_cast<size_t>(plugin->sampleRate / maxFreq);
+    size_t maxPeriod = static_cast<size_t>(plugin->sampleRate / minFreq);
+    
+    // Clamp to reasonable bounds
+    minPeriod = std::max(minPeriod, static_cast<size_t>(4));
+    maxPeriod = std::min(maxPeriod, plugin->correlationBuffer.size() / 4); // More conservative
+    
+    if (minPeriod >= maxPeriod) return 0;
+    
+    float bestCorrelation = 0.0f;
+    size_t bestPeriod = 0;
+    size_t bufferSize = plugin->correlationBuffer.size();
+    
+    // Test different periods
+    for (size_t period = minPeriod; period <= maxPeriod; period++) {
+        float correlation = 0.0f;
+        float norm1 = 0.0f, norm2 = 0.0f;
+        
+        // Calculate correlation for this period
+        size_t compareLength = std::min(period * 4, bufferSize - period); // Compare up to 4 cycles
+        
+        for (size_t i = 0; i < compareLength; i++) {
+            size_t idx1 = (plugin->correlationPos + bufferSize - compareLength + i) % bufferSize;
+            size_t idx2 = (idx1 + bufferSize - period) % bufferSize;
+            
+            float val1 = plugin->correlationBuffer[idx1];
+            float val2 = plugin->correlationBuffer[idx2];
+            
+            correlation += val1 * val2;
+            norm1 += val1 * val1;
+            norm2 += val2 * val2;
+        }
+        
+        // Normalize correlation coefficient
+        if (norm1 > 0.0f && norm2 > 0.0f) {
+            correlation /= std::sqrt(norm1 * norm2);
+        }
+        
+        if (correlation > bestCorrelation && correlation > plugin->correlationThreshold) {
+            bestCorrelation = correlation;
+            bestPeriod = period;
+        }
+    }
+    
+    return bestPeriod;
+}
+
+// Generate a predicted pattern in the background
+static void generatePredictedPattern(WfcPlugin* plugin, std::vector<float>& targetPattern, size_t patternLength) {
+    targetPattern.clear();
+    
+    // Safety checks to prevent crashes
+    if (patternLength == 0 || patternLength > 10000 || 
+        plugin->inputBuffer.size() < 64 || plugin->bufferPos < 32) {
+        // Not enough data or invalid pattern length, fill with silence
+        targetPattern.resize(std::min(patternLength, static_cast<size_t>(2048)), 0.0f);
+        return;
+    }
+    
+    targetPattern.reserve(patternLength);
+    
+    size_t bufferSize = plugin->inputBuffer.size();
+    
+    for (size_t i = 0; i < patternLength; i++) {
+        // Create a small pattern from recent samples for prediction
+        std::vector<float> recentPattern;
+        recentPattern.reserve(8);
+        
+        // Get last 8 samples as pattern
+        for (int j = 7; j >= 0; j--) {
+            size_t patternPos = (plugin->bufferPos + bufferSize - j - 1 + i) % bufferSize;
+            recentPattern.push_back(plugin->inputBuffer[patternPos]);
+        }
+        
+        // Simple WFC: find best matching pattern in buffer and predict next sample
+        float bestMatch = 0.0f;
+        float minDistance = std::numeric_limits<float>::max();
+        
+        // Search through buffer for similar patterns (limited search for real-time)
+        size_t searchLimit = std::min(bufferSize / 2, static_cast<size_t>(512)); // Smaller search for background
+        for (size_t k = 8; k < searchLimit; k += 8) { // Larger step for performance
+            float distance = 0.0f;
+            
+            // Compare pattern
+            for (int p = 0; p < 8; p++) {
+                size_t comparePos = (k - 8 + p + bufferSize) % bufferSize;
+                float diff = recentPattern[p] - plugin->inputBuffer[comparePos];
+                distance += diff * diff;
+            }
+            
+            if (distance < minDistance) {
+                minDistance = distance;
+                // Get the sample that followed this pattern
+                size_t nextPos = (k + bufferSize) % bufferSize;
+                bestMatch = plugin->inputBuffer[nextPos];
+            }
+        }
+        
+        // Clamp predicted sample to prevent overload
+        bestMatch = std::clamp(bestMatch, -1.0f, 1.0f);
+        targetPattern.push_back(bestMatch);
+    }
+}
 
 static LV2_Handle instantiate(const LV2_Descriptor* descriptor,
                             double rate,
@@ -418,8 +562,38 @@ static LV2_Handle instantiate(const LV2_Descriptor* descriptor,
     plugin->totalSamplesProcessed = 0;
     plugin->lastMemoryUsage = 0;
     
-    // Initialize input buffer
-    plugin->inputBuffer.resize(plugin->lastBufferSize);
+    // Initialize all port pointers to null for safety
+    plugin->input = nullptr;
+    plugin->output = nullptr;
+    plugin->patternSize = nullptr;
+    plugin->quantLevels = nullptr;
+    plugin->patternThreshold = nullptr;
+    plugin->mix = nullptr;
+    plugin->learningRate = nullptr;
+    plugin->randomness = nullptr;
+    plugin->bufferSize = nullptr;
+    plugin->memoryLimit = nullptr;
+    plugin->periodDetectEnable = nullptr;
+    plugin->minFreq = nullptr;
+    plugin->maxFreq = nullptr;
+    plugin->patternRepeats = nullptr;
+    
+    // Initialize period detection - smaller buffer to avoid memory issues
+    size_t correlationSize = std::min(static_cast<size_t>(rate * 1.0), static_cast<size_t>(44100)); // Max 1 second
+    plugin->correlationBuffer.resize(correlationSize, 0.0f);
+    plugin->correlationPos = 0;
+    plugin->detectedPeriod = 0;
+    plugin->correlationThreshold = 0.7f;
+    
+    // Initialize pattern alternation
+    plugin->currentPattern.clear();
+    plugin->nextPattern.clear();
+    plugin->patternPlaybackPos = 0;
+    plugin->currentRepeatCount = 0;
+    plugin->backgroundPredictionReady = false;
+    
+    // Initialize input buffer with silence
+    plugin->inputBuffer.resize(plugin->lastBufferSize, 0.0f);
     
     // Set initial buffer size
     plugin->wfc->setBufferSize(plugin->lastBufferSize);
@@ -461,11 +635,36 @@ static void connect_port(LV2_Handle instance, uint32_t port, void* data) {
         case WFC_MEMORY_LIMIT:
             plugin->memoryLimit = (const float*)data;
             break;
+        case WFC_PERIOD_DETECT:
+            plugin->periodDetectEnable = (const float*)data;
+            break;
+        case WFC_MIN_FREQ:
+            plugin->minFreq = (const float*)data;
+            break;
+        case WFC_MAX_FREQ:
+            plugin->maxFreq = (const float*)data;
+            break;
+        case WFC_PATTERN_REPEATS:
+            plugin->patternRepeats = (const float*)data;
+            break;
     }
 }
 
 static void run(LV2_Handle instance, uint32_t nFrames) {
     WfcPlugin* plugin = (WfcPlugin*)instance;
+    
+    // Safety checks to prevent crashes
+    if (!plugin || !plugin->input || !plugin->output) {
+        return;
+    }
+    
+    // If critical ports aren't connected yet, pass through input
+    if (!plugin->mix) {
+        for (uint32_t i = 0; i < nFrames; ++i) {
+            plugin->output[i] = plugin->input[i]; // Pass through input
+        }
+        return;
+    }
     
     // Update parameters (less frequently to avoid audio thread issues)
     static uint32_t paramUpdateCounter = 0;
@@ -475,42 +674,152 @@ static void run(LV2_Handle instance, uint32_t nFrames) {
         plugin->wfc->setQuantLevels((int)*plugin->quantLevels);
         plugin->wfc->setPatternThreshold((int)*plugin->patternThreshold);
         plugin->wfc->setRandomness(*plugin->randomness);
+        plugin->wfc->setMemoryLimit((size_t)*plugin->memoryLimit);
+        
+        // Period detection and buffer size determination
+        size_t newBufferSize;
+        bool periodDetectEnabled = *plugin->periodDetectEnable > 0.5f;
+        if (periodDetectEnabled && plugin->correlationPos > 10000) { // Wait for enough data
+            size_t detectedPeriod = detectPeriod(plugin, *plugin->minFreq, *plugin->maxFreq);
+            if (detectedPeriod > 0 && detectedPeriod < 100000) { // Sanity check
+                // Use detected period as buffer size, round to power of 2
+                size_t periodBufferSize = detectedPeriod * 2; // Use 2 cycles for better pattern matching
+                
+                // Round to nearest power of 2
+                size_t powerOf2 = 1;
+                while (powerOf2 < periodBufferSize && powerOf2 < 1048576) {
+                    powerOf2 <<= 1;
+                }
+                
+                plugin->detectedPeriod = detectedPeriod;
+                newBufferSize = powerOf2;
+            } else {
+                newBufferSize = (size_t)*plugin->bufferSize; // Fallback to manual setting
+            }
+        } else {
+            newBufferSize = (size_t)*plugin->bufferSize; // Manual buffer size
+        }
         
         // Handle buffer size changes
-        size_t newBufferSize = (size_t)*plugin->bufferSize;
         if (newBufferSize != plugin->lastBufferSize) {
             plugin->lastBufferSize = newBufferSize;
             plugin->wfc->setBufferSize(newBufferSize);
-            plugin->inputBuffer.resize(newBufferSize);
+            plugin->inputBuffer.resize(newBufferSize, 0.0f); // Initialize with silence
             plugin->bufferPos = 0; // Reset position after resize
         }
     }
     
-    float mixAmount = std::clamp(*plugin->mix, 0.0f, 1.0f);
-    float learningRate = std::clamp(*plugin->learningRate, 0.0f, 1.0f);
+    // Parameters are used inside the loop, no need to pre-calculate
     
     for (uint32_t i = 0; i < nFrames; ++i) {
         float inputSample = plugin->input[i];
+        
+        // Add to correlation buffer for period detection
+        plugin->correlationBuffer[plugin->correlationPos] = inputSample;
+        plugin->correlationPos = (plugin->correlationPos + 1) % plugin->correlationBuffer.size();
         
         // Add to learning buffer
         plugin->inputBuffer[plugin->bufferPos] = inputSample;
         plugin->bufferPos = (plugin->bufferPos + 1) % plugin->inputBuffer.size();
         
-        // Real-time learning from buffer (every 64 samples for better responsiveness)
-        if (++plugin->learningCounter >= 64) {
-            plugin->learningCounter = 0;
-            // Learn from smaller chunks to reduce processing spikes
-            size_t chunkSize = std::min(plugin->inputBuffer.size(), static_cast<size_t>(512));
-            plugin->wfc->learnFromSamples(plugin->inputBuffer.data(), 
-                                        chunkSize, 
-                                        learningRate);
+        // Variable delay based on buffer size parameter
+        float delayedSample = 0.0f;
+        size_t bufferSize = plugin->inputBuffer.size();
+        
+        // Use a fraction of buffer size for delay, minimum 512 samples for audibility
+        size_t delayLength = std::max(static_cast<size_t>(512), bufferSize / 4);
+        
+        // Wait until we have enough samples in buffer
+        if (plugin->bufferPos >= delayLength) {
+            size_t delayPos = (plugin->bufferPos + bufferSize - delayLength) % bufferSize;
+            delayedSample = plugin->inputBuffer[delayPos];
+        } else if (bufferSize > delayLength) {
+            // Handle initial case when buffer isn't full yet
+            size_t delayPos = (plugin->bufferPos + bufferSize - delayLength) % bufferSize;
+            delayedSample = plugin->inputBuffer[delayPos];
         }
         
-        // Generate WFC sample
-        float wfcSample = plugin->wfc->generateSample();
+        // Apply pattern alternation system
+        float learningRate = plugin->learningRate ? *plugin->learningRate : 0.1f;
+        float wfcSample = delayedSample;
         
-        // Mix with original
-        plugin->output[i] = inputSample * (1.0f - mixAmount) + wfcSample * mixAmount;
+        // Apply WFC/delay even with basic parameters
+        if (bufferSize > 512 && plugin->bufferPos > 512) {
+            size_t maxRepeats = plugin->patternRepeats ? static_cast<size_t>(*plugin->patternRepeats) : 2;
+            
+            // Use detected period for pattern length, fallback to time-based
+            size_t patternLength;
+            if (plugin->detectedPeriod > 0 && plugin->detectedPeriod < 10000) {
+                // Use detected period as pattern length
+                patternLength = plugin->detectedPeriod;
+            } else {
+                // Fallback to 50ms patterns
+                patternLength = std::min(static_cast<size_t>(plugin->sampleRate * 0.05f), static_cast<size_t>(2048));
+            }
+            
+            // Initialize pattern system if needed
+            if (plugin->currentPattern.empty() && patternLength > 0 && patternLength < 10000) {
+                generatePredictedPattern(plugin, plugin->currentPattern, patternLength);
+                plugin->patternPlaybackPos = 0;
+                plugin->currentRepeatCount = 0;
+            }
+            
+            // Check if we need to switch to next pattern
+            if (plugin->patternPlaybackPos >= plugin->currentPattern.size()) {
+                plugin->currentRepeatCount++;
+                plugin->patternPlaybackPos = 0;
+                
+                // If we've repeated enough times, switch to next pattern
+                if (plugin->currentRepeatCount >= maxRepeats) {
+                    if (plugin->backgroundPredictionReady && !plugin->nextPattern.empty()) {
+                        // Switch to next pattern
+                        plugin->currentPattern = std::move(plugin->nextPattern);
+                        plugin->nextPattern.clear();
+                        plugin->backgroundPredictionReady = false;
+                    } else {
+                        // Generate new pattern immediately if background isn't ready
+                        generatePredictedPattern(plugin, plugin->currentPattern, patternLength);
+                    }
+                    plugin->currentRepeatCount = 0;
+                    plugin->patternPlaybackPos = 0;
+                }
+            }
+            
+            // Generate next pattern in background - simplified timing to avoid crashes
+            static uint32_t backgroundCounter = 0;
+            if (++backgroundCounter >= 4096 && !plugin->backgroundPredictionReady) { // Every ~80ms
+                backgroundCounter = 0;
+                if (patternLength > 0 && patternLength < 10000) { // Safety check
+                    generatePredictedPattern(plugin, plugin->nextPattern, patternLength);
+                    plugin->backgroundPredictionReady = true;
+                }
+            }
+            
+            // Get sample from current pattern
+            if (!plugin->currentPattern.empty() && plugin->patternPlaybackPos < plugin->currentPattern.size()) {
+                float patternSample = plugin->currentPattern[plugin->patternPlaybackPos];
+                plugin->patternPlaybackPos++;
+                
+                // Clamp pattern sample to prevent overload
+                patternSample = std::clamp(patternSample, -1.0f, 1.0f);
+                
+                // Blend pattern with delayed sample
+                wfcSample = delayedSample * (1.0f - learningRate) + patternSample * learningRate;
+            }
+        }
+        
+        // Mix with original - ensure it always works
+        float mixAmount = std::clamp(*plugin->mix, 0.0f, 1.0f);
+        
+        // If no WFC processing happened, at least pass through the delay
+        if (wfcSample == 0.0f && delayedSample != 0.0f) {
+            wfcSample = delayedSample;
+        }
+        
+        float outputSample = inputSample * (1.0f - mixAmount) + wfcSample * mixAmount;
+        
+        // Hard limit output to prevent overload
+        plugin->output[i] = std::clamp(outputSample, -1.0f, 1.0f);
     }
 }
 
